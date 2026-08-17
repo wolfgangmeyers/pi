@@ -227,6 +227,7 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 
 		try {
 			const supportsStrictMode = model.compat?.supportsStrictMode ?? false;
+			const toolNameMapper = createBedrockToolNameMapper(context.tools);
 			const client = new BedrockRuntimeClient(config);
 			let observedRawResponse = false;
 			if (options.onResponse) {
@@ -242,13 +243,13 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			const inferenceMaxTokens = options.maxTokens ?? (isAnthropicClaudeModel(model) ? model.maxTokens : undefined);
 			let commandInput = {
 				modelId: model.id,
-				messages: convertMessages(context, model, cacheRetention, options.env),
+				messages: convertMessages(context, model, cacheRetention, options.env, toolNameMapper),
 				system: buildSystemPrompt(context.systemPrompt, model, cacheRetention, options.env),
 				inferenceConfig: {
 					...(inferenceMaxTokens !== undefined && { maxTokens: inferenceMaxTokens }),
 					...(options.temperature !== undefined && { temperature: options.temperature }),
 				},
-				toolConfig: convertToolConfig(context.tools, options.toolChoice, supportsStrictMode),
+				toolConfig: convertToolConfig(context.tools, options.toolChoice, supportsStrictMode, toolNameMapper),
 				additionalModelRequestFields: buildAdditionalModelRequestFields(model, options),
 				...(options.requestMetadata !== undefined && { requestMetadata: options.requestMetadata }),
 			};
@@ -275,7 +276,7 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 					}
 					stream.push({ type: "start", partial: output });
 				} else if (item.contentBlockStart) {
-					handleContentBlockStart(item.contentBlockStart, blocks, output, stream);
+					handleContentBlockStart(item.contentBlockStart, blocks, output, stream, toolNameMapper);
 				} else if (item.contentBlockDelta) {
 					handleContentBlockDelta(item.contentBlockDelta, blocks, output, stream);
 				} else if (item.contentBlockStop) {
@@ -322,7 +323,7 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 				delete (block as Block).partialJson;
 			}
 			output.stopReason = options.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatBedrockError(error);
+			output.errorMessage = await formatBedrockError(error);
 			if (output.stopReason === "error") {
 				appendBedrockFailureDiagnostic(output, error, responseRequestId);
 			}
@@ -362,15 +363,17 @@ const BEDROCK_DATA_RETENTION_DOCS_URL = "https://docs.aws.amazon.com/bedrock/lat
  * human-readable prefix so downstream consumers (retry logic, context-overflow
  * detection) can distinguish error categories via simple string matching.
  */
-function formatBedrockError(error: unknown): string {
+async function formatBedrockError(error: unknown): Promise<string> {
 	const norm = normalizeProviderError(error);
-	// Surface the raw HTTP body (with status) when the SDK did not fold it into
-	// the message; otherwise fall back to the message. This is what stops a
-	// gateway 403 from collapsing to `Unknown: UnknownError`.
+	const responseBody = await readBedrockErrorResponseBody(error);
+	// Bedrock normally deserializes the response into error.message. Some model
+	// adapters instead leave the validation JSON in the unread Node response
+	// stream, which used to stringify as Node internals rather than the reason.
 	const core =
-		!norm.messageCarriesBody && norm.status !== undefined && norm.body !== undefined
+		responseBody ??
+		(!norm.messageCarriesBody && norm.status !== undefined && norm.body !== undefined
 			? `${norm.status}: ${norm.body}`
-			: norm.message;
+			: norm.message);
 	const dataRetentionHint = /data retention mode/i.test(core)
 		? ` See ${BEDROCK_DATA_RETENTION_DOCS_URL} for supported data retention modes.`
 		: "";
@@ -379,6 +382,36 @@ function formatBedrockError(error: unknown): string {
 		return `${prefix}: ${core}${dataRetentionHint}`;
 	}
 	return `${core}${dataRetentionHint}`;
+}
+
+type BedrockResponseBody = { $response?: { body?: unknown } };
+
+/** Read only the bounded text returned by an unmodeled Bedrock error response. */
+async function readBedrockErrorResponseBody(error: unknown): Promise<string | undefined> {
+	const body = (error as BedrockResponseBody)?.$response?.body;
+	if (!isAsyncIterable(body)) return undefined;
+
+	const decoder = new TextDecoder();
+	let text = "";
+	try {
+		for await (const chunk of body) {
+			text += decoder.decode(toBytes(chunk), { stream: true });
+			if (text.length > 4000) return `${text.slice(0, 4000)}... [truncated]`;
+		}
+		text += decoder.decode();
+		return text.trim() || undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
+	return typeof value === "object" && value !== null && Symbol.asyncIterator in value;
+}
+
+function toBytes(chunk: unknown): Uint8Array {
+	if (typeof chunk === "string") return new TextEncoder().encode(chunk);
+	return chunk instanceof Uint8Array ? chunk : new Uint8Array();
 }
 
 type SdkErrorMetadata = { $metadata?: { httpStatusCode?: unknown; requestId?: unknown } };
@@ -553,6 +586,7 @@ function handleContentBlockStart(
 	blocks: Block[],
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
+	toolNameMapper: BedrockToolNameMapper = IDENTITY_TOOL_NAME_MAPPER,
 ): void {
 	const index = event.contentBlockIndex!;
 	const start = event.start;
@@ -561,7 +595,7 @@ function handleContentBlockStart(
 		const block: Block = {
 			type: "toolCall",
 			id: start.toolUse.toolUseId || "",
-			name: start.toolUse.name || "",
+			name: toolNameMapper.fromProviderName(start.toolUse.name || ""),
 			arguments: {},
 			partialJson: "",
 			index,
@@ -834,6 +868,45 @@ function normalizeToolCallId(id: string): string {
 	return sanitized.length > 64 ? sanitized.slice(0, 64) : sanitized;
 }
 
+type BedrockToolNameMapper = {
+	toProviderName(name: string): string;
+	fromProviderName(name: string): string;
+};
+
+const IDENTITY_TOOL_NAME_MAPPER: BedrockToolNameMapper = {
+	toProviderName: (name) => name,
+	fromProviderName: (name) => name,
+};
+
+function normalizeBedrockToolName(name: string): string {
+	const sanitized = name.replace(/[^a-zA-Z0-9_-]/g, "_");
+	const prefixed = /^[a-zA-Z0-9]/.test(sanitized) ? sanitized : `_${sanitized}`;
+	return prefixed.slice(0, 64);
+}
+
+function createBedrockToolNameMapper(tools: Tool[] | undefined): BedrockToolNameMapper {
+	if (!tools?.length) return IDENTITY_TOOL_NAME_MAPPER;
+
+	const originalToProvider = new Map<string, string>();
+	const providerToOriginal = new Map<string, string>();
+	for (const tool of tools) {
+		const providerName = normalizeBedrockToolName(tool.name);
+		const existing = providerToOriginal.get(providerName);
+		if (existing !== undefined && existing !== tool.name) {
+			throw new Error(
+				`Bedrock tool names "${existing}" and "${tool.name}" both normalize to "${providerName}".`,
+			);
+		}
+		originalToProvider.set(tool.name, providerName);
+		providerToOriginal.set(providerName, tool.name);
+	}
+
+	return {
+		toProviderName: (name) => originalToProvider.get(name) ?? normalizeBedrockToolName(name),
+		fromProviderName: (name) => providerToOriginal.get(name) ?? name,
+	};
+}
+
 function createNonBlankTextBlock(text: string): ContentBlock.TextMember | undefined {
 	const sanitized = sanitizeSurrogates(text);
 	return sanitized.trim().length === 0 ? undefined : { text: sanitized };
@@ -876,6 +949,7 @@ function convertMessages(
 	model: Model<"bedrock-converse-stream">,
 	cacheRetention: CacheRetention,
 	env?: ProviderEnv,
+	toolNameMapper: BedrockToolNameMapper = IDENTITY_TOOL_NAME_MAPPER,
 ): Message[] {
 	const result: Message[] = [];
 	const transformedMessages = transformMessages(context.messages, model, normalizeToolCallId);
@@ -929,7 +1003,11 @@ function convertMessages(
 						}
 						case "toolCall":
 							contentBlocks.push({
-								toolUse: { toolUseId: c.id, name: c.name, input: sanitizeBedrockDocument(c.arguments) },
+								toolUse: {
+									toolUseId: c.id,
+									name: toolNameMapper.toProviderName(c.name),
+									input: sanitizeBedrockDocument(c.arguments),
+								},
 							});
 							break;
 						case "thinking": {
@@ -1040,6 +1118,7 @@ function convertToolConfig(
 	tools: Tool[] | undefined,
 	toolChoice: BedrockOptions["toolChoice"],
 	supportsStrictMode: boolean,
+	toolNameMapper: BedrockToolNameMapper = IDENTITY_TOOL_NAME_MAPPER,
 ): ToolConfiguration | undefined {
 	if (!tools?.length) return undefined;
 	if (toolChoice === "none") return undefined;
@@ -1048,9 +1127,9 @@ function convertToolConfig(
 		const strict = resolveJsonSchemaStrictSampling(tool, supportsStrictMode);
 		return {
 			toolSpec: {
-				name: tool.name,
+				name: toolNameMapper.toProviderName(tool.name),
 				description: tool.description,
-				inputSchema: { json: getJsonSchemaToolParameters(tool, strict) as unknown as DocumentType },
+				inputSchema: { json: ensureBedrockToolInputObject(getJsonSchemaToolParameters(tool, strict)) },
 				...(strict === true ? { strict: true } : {}),
 			},
 		};
@@ -1066,11 +1145,24 @@ function convertToolConfig(
 			break;
 		default:
 			if (toolChoice?.type === "tool") {
-				bedrockToolChoice = { tool: { name: toolChoice.name } };
+				if (!tools.some((tool) => tool.name === toolChoice.name)) {
+					throw new Error(`Bedrock tool choice references unknown tool name "${toolChoice.name}".`);
+				}
+				bedrockToolChoice = { tool: { name: toolNameMapper.toProviderName(toolChoice.name) } };
 			}
 	}
 
 	return { tools: bedrockTools, toolChoice: bedrockToolChoice };
+}
+
+/** Bedrock requires every tool input schema root to declare `type: object`. */
+function ensureBedrockToolInputObject(schema: Tool["parameters"]): DocumentType {
+	if (typeof schema !== "object" || schema === null || Array.isArray(schema) || "type" in schema) {
+		return schema as unknown as DocumentType;
+	}
+	// Tool calls are object arguments. Preserve compositional constraints such as
+	// oneOf while making that invariant explicit for Bedrock's schema validator.
+	return { type: "object", ...schema } as DocumentType;
 }
 
 function mapStopReason(reason: string | undefined): { stopReason: StopReason; errorMessage?: string } {
