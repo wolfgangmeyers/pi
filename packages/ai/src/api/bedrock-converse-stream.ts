@@ -1050,7 +1050,7 @@ function convertToolConfig(
 			toolSpec: {
 				name: tool.name,
 				description: tool.description,
-				inputSchema: { json: getJsonSchemaToolParameters(tool, strict) as unknown as DocumentType },
+				inputSchema: { json: ensureBedrockToolInputObject(getJsonSchemaToolParameters(tool, strict)) },
 				...(strict === true ? { strict: true } : {}),
 			},
 		};
@@ -1071,6 +1071,17 @@ function convertToolConfig(
 	}
 
 	return { tools: bedrockTools, toolChoice: bedrockToolChoice };
+}
+
+/** Bedrock requires compositional tool input schema roots to declare `type: object`. */
+function ensureBedrockToolInputObject(schema: Tool["parameters"]): DocumentType {
+	if (typeof schema !== "object" || schema === null || Array.isArray(schema) || "type" in schema) {
+		return schema as unknown as DocumentType;
+	}
+	if (!("oneOf" in schema || "anyOf" in schema || "allOf" in schema)) {
+		return schema as unknown as DocumentType;
+	}
+	return { type: "object", ...schema } as DocumentType;
 }
 
 function mapStopReason(reason: string | undefined): { stopReason: StopReason; errorMessage?: string } {

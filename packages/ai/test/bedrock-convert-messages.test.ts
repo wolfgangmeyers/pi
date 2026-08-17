@@ -56,7 +56,7 @@ vi.mock("@aws-sdk/client-bedrock-runtime", () => {
 });
 
 import { stream as streamBedrock } from "../src/api/bedrock-converse-stream.ts";
-import type { Context, Message, Model } from "../src/types.ts";
+import type { Context, Message, Model, Tool } from "../src/types.ts";
 
 const baseModel: Model<"bedrock-converse-stream"> = {
 	id: "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
@@ -121,6 +121,49 @@ describe("Bedrock constrained sampling", () => {
 			}
 		).toolConfig;
 		expect(novaToolConfig.tools[0].toolSpec.strict).toBeUndefined();
+	});
+
+	it("adds an object root to compositional tool schemas", async () => {
+		const compositionalSchemas = [
+			{ oneOf: [{ type: "object", properties: { text: { type: "string" } } }] },
+			{ anyOf: [{ type: "object", properties: { recipient: { type: "string" } } }] },
+			{ allOf: [{ type: "object", properties: { count: { type: "number" } } }] },
+		];
+
+		for (const parameters of compositionalSchemas) {
+			const payload = await capturePayload({
+				messages: [{ role: "user", content: "Use the tool", timestamp: Date.now() }],
+				tools: [
+					{ name: "send_message", description: "Send a message", parameters: parameters as Tool["parameters"] },
+				],
+			});
+			const toolSchema = (
+				payload as { toolConfig: { tools: Array<{ toolSpec: { inputSchema: { json: unknown } } }> } }
+			).toolConfig.tools[0].toolSpec.inputSchema.json;
+
+			expect(toolSchema).toEqual({ type: "object", ...parameters });
+		}
+
+		const unchangedSchemas = [
+			{ properties: { text: { type: "string" } } },
+			{ type: "string", oneOf: [{ type: "string" }] },
+			null,
+			["not", "a", "schema"],
+			"not a schema",
+		];
+		for (const parameters of unchangedSchemas) {
+			const payload = await capturePayload({
+				messages: [{ role: "user", content: "Use the tool", timestamp: Date.now() }],
+				tools: [
+					{ name: "send_message", description: "Send a message", parameters: parameters as Tool["parameters"] },
+				],
+			});
+			const toolSchema = (
+				payload as { toolConfig: { tools: Array<{ toolSpec: { inputSchema: { json: unknown } } }> } }
+			).toolConfig.tools[0].toolSpec.inputSchema.json;
+
+			expect(toolSchema).toBe(parameters);
+		}
 	});
 });
 
